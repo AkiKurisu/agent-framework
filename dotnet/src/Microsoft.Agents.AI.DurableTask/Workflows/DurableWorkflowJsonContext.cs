@@ -33,6 +33,7 @@ namespace Microsoft.Agents.AI.DurableTask.Workflows;
 [JsonSerializable(typeof(List<TypedPayload>))]
 [JsonSerializable(typeof(DurableWorkflowCustomStatus))]
 [JsonSerializable(typeof(DurableWorkflowResult))]
+[JsonSerializable(typeof(PendingExternalEventStatus))]
 [JsonSerializable(typeof(List<string>))]
 [JsonSerializable(typeof(Dictionary<string, string>))]
 [JsonSerializable(typeof(Dictionary<string, string?>))]

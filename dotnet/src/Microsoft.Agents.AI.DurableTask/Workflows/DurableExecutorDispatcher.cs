@@ -8,31 +8,34 @@
 // Using ConfigureAwait(false) here could cause non-deterministic behavior during replay.
 
 using System.Text.Json;
+using Microsoft.Agents.AI.Workflows;
 using Microsoft.DurableTask;
 using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Agents.AI.DurableTask.Workflows;
 
 /// <summary>
-/// Dispatches workflow executors to activities, AI agents, or sub-orchestrations.
+/// Dispatches workflow executors to activities, AI agents, sub-orchestrations, or external events (human-in-the-loop).
 /// </summary>
 /// <remarks>
 /// Called during the dispatch phase of each superstep by
 /// <c>DurableWorkflowRunner.DispatchExecutorsInParallelAsync</c>. For each executor that has
 /// pending input, this dispatcher determines whether the executor is an AI agent (stateful,
-/// backed by Durable Entities), a sub-workflow (dispatched as a sub-orchestration), or a
-/// regular activity, and invokes the appropriate Durable Task API.
+/// backed by Durable Entities), a request port (human-in-the-loop, backed by external events),
+/// a sub-workflow (dispatched as a sub-orchestration), or a regular activity, and invokes the
+/// appropriate Durable Task API.
 /// The serialised string result is returned to the runner for the routing phase.
 /// </remarks>
 internal static class DurableExecutorDispatcher
 {
     /// <summary>
-    /// Dispatches an executor based on its type (activity, AI agent, or sub-workflow).
+    /// Dispatches an executor based on its type (activity, AI agent, request port, or sub-workflow).
     /// </summary>
     /// <param name="context">The task orchestration context.</param>
     /// <param name="executorInfo">Information about the executor to dispatch.</param>
     /// <param name="envelope">The message envelope containing input and type information.</param>
     /// <param name="sharedState">The shared state dictionary to pass to the executor.</param>
+    /// <param name="customStatus">The custom status object for streaming and HITL signaling.</param>
     /// <param name="logger">The logger for tracing.</param>
     /// <returns>The result from the executor.</returns>
     internal static async Task<string> DispatchAsync(
@@ -40,9 +43,15 @@ internal static class DurableExecutorDispatcher
         WorkflowExecutorInfo executorInfo,
         DurableMessageEnvelope envelope,
         Dictionary<string, string> sharedState,
+        DurableWorkflowCustomStatus customStatus,
         ILogger logger)
     {
         logger.LogDispatchingExecutor(executorInfo.ExecutorId, executorInfo.IsAgenticExecutor);
+
+        if (executorInfo.IsRequestPortExecutor)
+        {
+            return await ExecuteRequestPortAsync(context, executorInfo, envelope.Message, customStatus, logger).ConfigureAwait(true);
+        }
 
         if (executorInfo.IsAgenticExecutor)
         {
@@ -77,6 +86,48 @@ internal static class DurableExecutorDispatcher
         string serializedInput = JsonSerializer.Serialize(activityInput, DurableWorkflowJsonContext.Default.DurableActivityInput);
 
         return await context.CallActivityAsync<string>(activityName, serializedInput).ConfigureAwait(true);
+    }
+
+    /// <summary>
+    /// Executes a request port executor by waiting for an external event (human-in-the-loop).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// When the workflow reaches a <see cref="RequestPort"/> executor, the orchestration sets
+    /// the custom status to indicate it is waiting for external input. The external actor
+    /// (e.g., a UI or API) can query this status to discover what input is needed and raise
+    /// the appropriate event using <see cref="DurableStreamingWorkflowRun.SendResponseAsync{TResponse}(DurableRequestInfoEvent, TResponse, CancellationToken)"/>.
+    /// </para>
+    /// </remarks>
+    private static async Task<string> ExecuteRequestPortAsync(
+        TaskOrchestrationContext context,
+        WorkflowExecutorInfo executorInfo,
+        string input,
+        DurableWorkflowCustomStatus customStatus,
+        ILogger logger)
+    {
+        RequestPort requestPort = executorInfo.RequestPort!;
+        string eventName = requestPort.Id;
+
+        logger.LogWaitingForExternalEvent(eventName);
+
+        // Set custom status to signal that the workflow is waiting for external input
+        customStatus.PendingEvent = new PendingExternalEventStatus(
+            EventName: eventName,
+            Input: input);
+
+        context.SetCustomStatus(customStatus);
+
+        // Wait for the external event (human-in-the-loop)
+        string response = await context.WaitForExternalEvent<string>(eventName).ConfigureAwait(true);
+
+        // Clear pending event status after receiving the event
+        customStatus.PendingEvent = null;
+        context.SetCustomStatus(customStatus.Events.Count > 0 ? customStatus : null);
+
+        logger.LogReceivedExternalEvent(eventName);
+
+        return response;
     }
 
     /// <summary>
